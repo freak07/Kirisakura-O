@@ -48,7 +48,6 @@
 #include <linux/file.h>
 #include <linux/kthread.h>
 #include <linux/dma-buf.h>
-#include <linux/power/htc_battery.h>
 #include "mdss_fb.h"
 #include "mdss_mdp_splash_logo.h"
 #define CREATE_TRACE_POINTS
@@ -75,6 +74,13 @@
 #define BLANK_FLAG_LP	FB_BLANK_VSYNC_SUSPEND
 #define BLANK_FLAG_ULP	FB_BLANK_NORMAL
 #endif
+
+#define MDSS_BRIGHT_TO_BL_DIMMER(out, v) do {\
+			out = (12*v*v+1393*v+3060)/4465;\
+			} while (0)
+
+bool backlight_dimmer = false;
+module_param(backlight_dimmer, bool, 0755);
 
 static struct fb_info *fbi_list[MAX_FBI_LIST];
 static int fbi_list_index;
@@ -274,30 +280,17 @@ static void mdss_fb_set_bl_brightness(struct led_classdev *led_cdev,
 	if (value > mfd->panel_info->brightness_max)
 		value = mfd->panel_info->brightness_max;
 
-	/* Check if the current bl is in dim level or not,
-	   except bl = zero */
-	if (mfd->panel_info->bl_dim_check) {
-		bool dim_status = false;
-
-		if ((value > 0) && (value <= mfd->panel_info->bl_dim_check)) {
-			dim_status = true;
-		} else {
-			dim_status = false;
-		}
-
-		if (mfd->panel_info->bl_dim_status != dim_status) {
-			mfd->panel_info->bl_dim_status = dim_status;
-			/* bl_dim_status = true :  dim level
-			   bl_dim_stauts = false : 0 or over dim */
-			htc_battery_backlight_dim_mode_check(mfd->panel_info->bl_dim_status);
-			pr_info("bl_dim_status =%d\n", mfd->panel_info->bl_dim_status);
-		}
+	if (backlight_dimmer) {
+		if (value < 3)
+			bl_lvl = 1;
+		else
+			MDSS_BRIGHT_TO_BL_DIMMER(bl_lvl, value);
+	} else {
+		/* This maps android backlight level 0 to 255 into
+		   driver backlight level 0 to bl_max with rounding */
+		MDSS_BRIGHT_TO_BL(bl_lvl, value, mfd->panel_info->bl_max,
+					mfd->panel_info->brightness_max);
 	}
-
-	/* This maps android backlight level 0 to 255 into
-	   driver backlight level 0 to bl_max with rounding */
-	MDSS_BRIGHT_TO_BL(bl_lvl, value, mfd->panel_info->bl_max,
-				mfd->panel_info->brightness_max);
 
 	if (!bl_lvl && value)
 		bl_lvl = 1;
@@ -670,8 +663,8 @@ static ssize_t mdss_fb_force_panel_dead(struct device *dev,
 		return len;
 	}
 
-	if (kstrtouint(buf, 0, &pdata->panel_info.panel_force_dead))
-		pr_err("kstrtouint buf error!\n");
+	if (sscanf(buf, "%d", &pdata->panel_info.panel_force_dead) != 1)
+		pr_err("sccanf buf error!\n");
 
 	return len;
 }
@@ -784,8 +777,8 @@ static ssize_t mdss_fb_change_dfps_mode(struct device *dev,
 	}
 	pinfo = &pdata->panel_info;
 
-	if (kstrtouint(buf, 0, &dfps_mode)) {
-		pr_err("kstrtouint buf error!\n");
+	if (sscanf(buf, "%d", &dfps_mode) != 1) {
+		pr_err("sccanf buf error!\n");
 		return len;
 	}
 
@@ -3260,7 +3253,7 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 	struct mdp_layer_commit_v1 *commit_v1;
 	struct mdp_output_layer *output_layer;
 	struct mdss_panel_info *pinfo;
-	bool wait_for_finish, update = false, wb_change = false;
+	bool wait_for_finish, wb_change = false;
 	int ret = -EPERM;
 	u32 old_xres, old_yres, old_format;
 
@@ -3308,7 +3301,6 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 						output_layer->buffer.width,
 						output_layer->buffer.height,
 						output_layer->buffer.format);
-					update = true;
 				}
 			}
 			ret = mfd->mdp.atomic_validate(mfd, file, commit_v1);
@@ -3349,7 +3341,7 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 		ret = mdss_fb_pan_idle(mfd);
 
 end:
-	if (update && ret && (mfd->panel.type == WRITEBACK_PANEL) && wb_change)
+	if (ret && (mfd->panel.type == WRITEBACK_PANEL) && wb_change)
 		mdss_fb_update_resolution(mfd, old_xres, old_yres, old_format);
 	return ret;
 }
@@ -4194,6 +4186,8 @@ static int mdss_fb_handle_buf_sync_ioctl(struct msm_sync_pt_data *sync_pt_data,
 		goto buf_sync_err_2;
 	}
 
+	sync_fence_install(rel_fence, rel_fen_fd);
+
 	ret = copy_to_user(buf_sync->rel_fen_fd, &rel_fen_fd, sizeof(int));
 	if (ret) {
 		pr_err("%s: copy_to_user failed\n", sync_pt_data->fence_name);
@@ -4230,6 +4224,8 @@ static int mdss_fb_handle_buf_sync_ioctl(struct msm_sync_pt_data *sync_pt_data,
 		goto buf_sync_err_3;
 	}
 
+	sync_fence_install(retire_fence, retire_fen_fd);
+
 	ret = copy_to_user(buf_sync->retire_fen_fd, &retire_fen_fd,
 			sizeof(int));
 	if (ret) {
@@ -4240,11 +4236,7 @@ static int mdss_fb_handle_buf_sync_ioctl(struct msm_sync_pt_data *sync_pt_data,
 		goto buf_sync_err_3;
 	}
 
-	sync_fence_install(retire_fence, retire_fen_fd);
-
 skip_retire_fence:
-	sync_fence_install(rel_fence, rel_fen_fd);
-
 	mutex_unlock(&sync_pt_data->sync_mutex);
 
 	if (buf_sync->flags & MDP_BUF_SYNC_FLAG_WAIT)
